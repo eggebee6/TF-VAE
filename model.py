@@ -4,7 +4,7 @@ class VAEModel(tf.keras.Model):
   IMAGE_HEIGHT = 28
   IMAGE_WIDTH = 28
 
-  LATENT_DIMS = 2
+  LATENT_DIMS = 10
 
   CONV_STRIDE = 2
   CONV_FILTER_SIZE = 3
@@ -16,7 +16,10 @@ class VAEModel(tf.keras.Model):
   DOWNSAMPLED_WIDTH = IMAGE_WIDTH / TOTAL_DOWNSAMPLING
   LATENT_SHAPE = (DOWNSAMPLED_HEIGHT * DOWNSAMPLED_WIDTH, )
 
-  def __init__(self):
+  def __init__(self,
+    recon_param_scale = 1.0,
+    kl_param_scale = 1.0e-3):
+
     super(VAEModel, self).__init__()
 
     # Create encoder
@@ -33,12 +36,12 @@ class VAEModel(tf.keras.Model):
         strides = (2, 2),
         activation = 'relu'),
       tf.keras.layers.Flatten(),
-      tf.keras.layers.Dense(10 * 2)
+      tf.keras.layers.Dense(VAEModel.LATENT_DIMS * 2)
     ])
 
     # Create decoder
     self.decoder = tf.keras.Sequential([
-      tf.keras.layers.InputLayer(input_shape = (10, )),
+      tf.keras.layers.InputLayer(input_shape = (VAEModel.LATENT_DIMS, )),
       tf.keras.layers.Dense(
         units = 7 * 7 * 32,
         activation = tf.nn.relu),
@@ -62,13 +65,34 @@ class VAEModel(tf.keras.Model):
         padding = 'same')
     ])
 
+    # Set up loss functions
+    self.recon_loss_fn = tf.keras.losses.MeanSquaredError()
+
+    self.kl_loss_fn = lambda mean, logvars: 0.5 * tf.math.reduce_sum(
+      tf.math.exp(logvars) + tf.math.square(mean) - 1 - logvars,
+      axis = 1)
+
+    # Initialize training parameters
+    self.recon_param_scale = tf.constant(recon_param_scale)
+    self.kl_param_scale = tf.constant(kl_param_scale)
+
+    self.epoch_scale = tf.Variable(0.0, trainable = False)
+
+    self.min_recon_loss = tf.Variable(10000.0, trainable = False)
+    self.kl_balance_scale = tf.Variable(0.0, trainable = False)
+
     # Create loss metrics
     self.total_loss_metric = tf.keras.metrics.Mean(name = "Loss")
+    self.recon_loss_metric = tf.keras.metrics.Mean(name = "Recon loss")
+    self.kl_loss_metric = tf.keras.metrics.Mean(name = "KL loss")
 
 
   @property
   def metrics(self):
-    return [self.total_loss_metric]
+    return [
+      self.total_loss_metric,
+      self.recon_loss_metric,
+      self.kl_loss_metric]
 
 
   def call(self, inputs, training = False):
@@ -103,23 +127,54 @@ class VAEModel(tf.keras.Model):
     return recon, latent_sample, mean, logvars
 
 
+  @tf.function
   def train_step(self, data):
     """ Custom training step
 
     TODO: Document this
     """
     with tf.GradientTape() as tape:
+      # Forward pass through model
       recon, latent_sample, mean, logvars = self(data, training = True)
 
-      recon_loss = tf.keras.losses.mean_squared_error(data, recon)
-      # TODO: KL divergence
+      # Calculate losses
+      recon_loss = self.recon_loss_fn(data, recon)
+      kl_loss = self.kl_loss_fn(mean, logvars) * self.kl_balance_scale * self.epoch_scale
 
-      total_loss = recon_loss
-      # TODO: total_loss = recon_loss + kl_loss
+      # Weight losses and sum for total loss
+      recon_loss = recon_loss * self.recon_param_scale
+      kl_loss = kl_loss * self.kl_param_scale
+      total_loss = recon_loss + kl_loss
 
+    # Adjust KL balance
+    if (recon_loss > 0):
+      if (recon_loss < self.min_recon_loss):
+        self.min_recon_loss.assign(recon_loss)
+      self.kl_balance_scale.assign((self.min_recon_loss / recon_loss))
+
+    # Get gradients and update model
     gradients = tape.gradient(total_loss, self.trainable_variables)
     self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
 
+    # Update metrics
     self.total_loss_metric.update_state(total_loss)
+    self.recon_loss_metric.update_state(recon_loss)
+    self.kl_loss_metric.update_state(kl_loss)
 
-    return {"Total loss": self.total_loss_metric.result()}
+    return {
+      "Total loss": self.total_loss_metric.result(),
+      "Recon loss": self.recon_loss_metric.result(),
+      "KL loss" : self.kl_loss_metric.result()}
+
+
+class VAECallback(tf.keras.callbacks.Callback):
+  def __init__(self, vae, total_epochs):
+    if (total_epochs < 1):
+      raise ValueError("Total epochs must be at least 1")
+
+    self.vae = vae
+    self.total_epochs = total_epochs
+
+  def on_epoch_begin(self, epoch, logs = None):
+    # Adjust epoch scale at start of each epoch (first epoch is 0)
+    self.vae.epoch_scale.assign(epoch / self.total_epochs)
